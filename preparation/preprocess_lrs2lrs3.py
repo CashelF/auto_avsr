@@ -91,7 +91,7 @@ text_transform = TextTransform()
 
 # Load Data
 args.data_dir = os.path.normpath(args.data_dir)
-if args.gpu_type != "cuda" or "mps":
+if args.gpu_type not in ['cuda', 'mps']:
     raise ValueError("Invalid GPU type. Valid values for gpu_type are \"cuda\" and \"mps\". ")
 vid_dataloader = AVSRDataLoader(
     modality="video", detector=args.detector, convert_gray=False, gpu_type=args.gpu_type
