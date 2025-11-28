@@ -11,3 +11,5 @@ outputs/
 lrs2
 lip-read-dataset.zip
 vsr_trlrs3vox2_base.pth
+mvlrs_v1
+voxceleb2
