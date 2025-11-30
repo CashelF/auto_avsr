@@ -3,6 +3,7 @@
 import argparse
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
+import random
 
 import torch
 import torch.nn as nn
@@ -25,7 +26,7 @@ from tutorials.lora_overfit import (
 class HyperLoRALinear(nn.Module):
     """Linear layer with dynamic LoRA weights injected per batch."""
 
-    def __init__(self, linear: nn.Linear, rank: int, alpha: float, dropout: float = 0.0):
+    def __init__(self, linear: nn.Linear, rank: int, alpha: float, dropout: float = 0.0, name: str = ""):
         super().__init__()
         self.in_features = linear.in_features
         self.out_features = linear.out_features
@@ -42,27 +43,51 @@ class HyperLoRALinear(nn.Module):
         self.lora_A_weight: Optional[torch.Tensor] = None
         self.lora_B_weight: Optional[torch.Tensor] = None
 
+        # debug
+        self.layer_name = name
+
     def set_adapter(self, lora_A: torch.Tensor, lora_B: torch.Tensor) -> None:
         self.lora_A_weight = lora_A
         self.lora_B_weight = lora_B
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Frozen base output
         base = F.linear(x, self.weight, self.bias)
-        if self.lora_A_weight is None or self.lora_B_weight is None:
+
+        # Don't apply LoRA if adapters unset or we're in a no_grad region (e.g. prefix encoding) (or it will use prev lora adapter)
+        if (
+            self.lora_A_weight is None
+            or self.lora_B_weight is None
+            or not torch.is_grad_enabled()
+        ):
             return base
+
         x_drop = self.lora_dropout(x)
-        batch = x_drop.shape[0]
-        if self.lora_A_weight.shape[0] != batch:
-            raise ValueError(
-                f"LoRA batch mismatch: got activations for batch {batch}, "
-                f"but adapters for batch {self.lora_A_weight.shape[0]}"
-            )
-        x_flat = x_drop.view(batch, -1, self.in_features)
-        # per-sample LoRA via batched matmul
-        lora_mid = torch.einsum("bri,bni->bnr", self.lora_A_weight, x_flat)
-        lora_out = torch.einsum("bor,bnr->bno", self.lora_B_weight, lora_mid) * self.scaling
-        lora_out = lora_out.view(*x_drop.shape[:-1], self.out_features)
+
+        # Number of per-sample adapters
+        B = self.lora_A_weight.shape[0]
+
+        total_elems = x_drop.numel()
+        per_adapter = self.in_features * B
+
+        # If we can't evenly split x into B chunks of in_features, we don't know
+        # how to align adapters with activations -> skip LoRA for this call.
+        if total_elems % per_adapter != 0:
+            return base
+
+        S = total_elems // per_adapter
+        x_flat = x_drop.view(B, S, self.in_features)  # (B, S, in_features)
+
+        # lora_A: (B, rank, in_features)
+        # lora_B: (B, out_features, rank)
+        lora_mid = torch.einsum("bri,bsi->bsr", self.lora_A_weight, x_flat)
+        lora_out = torch.einsum("bor,bsr->bso", self.lora_B_weight, lora_mid) * self.scaling
+
+        lora_out = lora_out.reshape(*x_drop.shape[:-1], self.out_features)
+
         return base + lora_out
+
+
 
 
 @dataclass
@@ -142,6 +167,21 @@ class LoRAHyperNetwork(nn.Module):
             adapters[spec.name] = (lora_A, lora_B)
         return adapters
 
+def should_adapt_layer(full_name: str, linear: nn.Linear) -> bool:
+    # 1) Only encoder blocks
+    if not full_name.startswith("encoder.encoders."):
+        return False
+
+    # 2) Skip positional projection
+    if "linear_pos" in full_name:
+        return False
+
+    # Only last few encoder layers
+    # if not any(f"encoder.encoders.{i}." in full_name for i in range(8, 12)):
+    #     return False
+
+    return True
+
 
 def replace_linear_with_hyper_lora(
     module: nn.Module, rank: int, alpha: float, dropout: float
@@ -152,8 +192,8 @@ def replace_linear_with_hyper_lora(
     def _recurse(submodule: nn.Module, prefix: str = "") -> None:
         for name, child in list(submodule.named_children()):
             full_name = f"{prefix}.{name}" if prefix else name
-            if isinstance(child, nn.Linear):
-                adapter = HyperLoRALinear(child, rank=rank, alpha=alpha, dropout=dropout)
+            if isinstance(child, nn.Linear) and should_adapt_layer(full_name, child):
+                adapter = HyperLoRALinear(child, rank=rank, alpha=alpha, dropout=dropout, name=full_name)
                 setattr(submodule, name, adapter)
                 specs.append(AdapterSpec(full_name, child.in_features, child.out_features, rank))
                 adapters[full_name] = adapter
@@ -257,9 +297,10 @@ class HyperLoRALightningModule(LightningModule):
         self.log("val_cer", cer_tensor, prog_bar=True, on_step=False, on_epoch=True)
         self.log("val_wer", wer_tensor, prog_bar=True, on_step=False, on_epoch=True)
 
-        if batch_idx == 0:
-            self.print(f"Ref: {ref_texts[0]}")
-            self.print(f"Hyp: {hyp_texts[0]}")
+        random_batch = random.randint(0, len(batch)-1)
+        if batch_idx == random_batch:
+            self.print(f"Ref: {ref_texts[random_batch]}")
+            self.print(f"Hyp: {hyp_texts[random_batch]}")
 
     def configure_optimizers(self):
         params = list(self.conditioning_encoder.parameters()) + list(self.hypernetwork.parameters())
