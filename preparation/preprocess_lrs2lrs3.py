@@ -323,3 +323,5 @@ for data_filename in tqdm(filenames):
                 )
             )
 f.close()
+
+# python preprocess_lrs2lrs3.py --data-dir ../lrs2/dataset/data  --detector mediapipe --root-dir ../lrs2/dataset --dataset lrs2 --gpu_type cuda --subset train --groups 1 --job-index 0
