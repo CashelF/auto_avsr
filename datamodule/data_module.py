@@ -123,9 +123,10 @@ class DataModule(LightningDataModule):
         self.num_workers = num_workers
 
     def train_dataloader(self):
+        train_label_path = self._resolve_label_path(self.args.root_dir, self.args.train_file)
         dataset = AVDataset(
             root_dir=self.args.root_dir,
-            label_path=os.path.join(self.args.root_dir, "labels", self.args.train_file),
+            label_path=train_label_path,
             subset="train",
             modality=self.args.modality,
             audio_transform=AudioTransform("train"),
@@ -148,9 +149,10 @@ class DataModule(LightningDataModule):
         return dataloader
 
     def val_dataloader(self):
+        val_label_path = self._resolve_label_path(self.args.root_dir, self.args.val_file)
         dataset = AVDataset(
             root_dir=self.args.root_dir,
-            label_path=os.path.join(self.args.root_dir, "labels", self.args.val_file),
+            label_path=val_label_path,
             subset="val",
             modality=self.args.modality,
             audio_transform=AudioTransform("val"),
@@ -168,9 +170,10 @@ class DataModule(LightningDataModule):
         return dataloader
 
     def test_dataloader(self):
+        test_label_path = self._resolve_label_path(self.args.root_dir, self.args.test_file)
         dataset = AVDataset(
             root_dir=self.args.root_dir,
-            label_path=os.path.join(self.args.root_dir, "labels", self.args.test_file),
+            label_path=test_label_path,
             subset="test",
             modality=self.args.modality,
             audio_transform=AudioTransform(
@@ -180,3 +183,26 @@ class DataModule(LightningDataModule):
         )
         dataloader = torch.utils.data.DataLoader(dataset, batch_size=None)
         return dataloader
+
+    def _resolve_label_path(self, root_dir, label_file):
+        """Match preprocessing output layout by supporting label files at root or in labels/."""
+
+        # Absolute path provided.
+        if os.path.isabs(label_file):
+            if os.path.exists(label_file):
+                return label_file
+            raise FileNotFoundError(f"Label file not found: {label_file}")
+
+        # Prefer root_dir/<file> when the preprocessing script emits lists there.
+        direct_path = os.path.join(root_dir, label_file)
+        if os.path.exists(direct_path):
+            return direct_path
+
+        # Fall back to root_dir/labels/<file> for older layouts.
+        labels_path = os.path.join(root_dir, "labels", label_file)
+        if os.path.exists(labels_path):
+            return labels_path
+
+        raise FileNotFoundError(
+            f"Could not locate label file '{label_file}' in '{root_dir}' or '{os.path.join(root_dir, 'labels')}'."
+        )
