@@ -6,15 +6,15 @@ for i in $(seq 0 3); do
   echo "Starting job $i / 4"
   python -m preprocess_lrs2lrs3 \
     --data-dir ../lrs2/data \
-    --detector mediapipe \
+    --detector retinaface \
     --landmarks-dir ../lrs2/landmarks/LRS2_landmarks \
-    --root-dir ../lrs2/preprocessed_test \
-    --subset test \
+    --root-dir ../lrs2/preprocessed_train \
+    --subset train \
     --dataset lrs2 \
     --gpu_type cuda \
     --groups 4 \
     --job-index $i \
-    > logs/preprocess_lrs2_test_$i.log 2>&1 &
+    > logs/preprocess_lrs2_train_$i.log 2>&1 &
 done
 
 wait
