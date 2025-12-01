@@ -22,6 +22,9 @@ from tutorials.lora_overfit import (
     word_error_rate,
 )
 
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning)
+
 
 class HyperLoRALinear(nn.Module):
     """Linear layer with dynamic LoRA weights injected per batch."""
@@ -387,3 +390,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# python -m tutorials.hypernetwork_lora_train --root-dir lrs2 --train-file preprocessed_train/labels/lrs2_train_transcript_lengths_seg16s.csv --val-file preprocessed_val/labels/lrs2_val_transcript_lengths_seg16s.csv --pretrained-model-path vsr_trlrs3vox2_base.pth --modality video
