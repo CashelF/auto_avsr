@@ -4,6 +4,7 @@ import argparse
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 import random
+import math
 
 import torch
 import torch.nn as nn
@@ -57,11 +58,9 @@ class HyperLoRALinear(nn.Module):
         # Frozen base output
         base = F.linear(x, self.weight, self.bias)
 
-        # Don't apply LoRA if adapters unset or we're in a no_grad region (e.g. prefix encoding) (or it will use prev lora adapter)
         if (
             self.lora_A_weight is None
             or self.lora_B_weight is None
-            or not torch.is_grad_enabled()
         ):
             return base
 
@@ -111,9 +110,9 @@ class HyperLoRAConfig:
     lora_rank: int = 8
     lora_alpha: float = 16.0
     lora_dropout: float = 0.05
-    prefix_frames: int = 4
-    conditioning_dim: int = 512
-    lr: float = 1e-3
+    prefix_frames: int = 16
+    conditioning_dim: int = 256
+    lr: float = 1e-2
     weight_decay: float = 1e-4
     max_epochs: int = 20
     batch_size: Optional[int] = None
@@ -121,6 +120,7 @@ class HyperLoRAConfig:
     devices: int = 1
     seed: int = 42
     max_frames: int = 1600
+    resume_from: Optional[str] = None
 
 
 class EncoderConditioning(nn.Module):
@@ -128,6 +128,7 @@ class EncoderConditioning(nn.Module):
 
     def __init__(self, input_dim: int, hidden_dim: int):
         super().__init__()
+        self.norm = nn.LayerNorm(input_dim)
         self.project = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.ReLU(),
@@ -139,6 +140,7 @@ class EncoderConditioning(nn.Module):
         mask = make_non_pad_mask(lengths).to(encoded.device)
         denom = mask.sum(dim=1, keepdim=True).clamp_min(1)
         pooled = (encoded * mask.unsqueeze(-1)).sum(dim=1) / denom
+        pooled = self.norm(pooled)
         return self.project(pooled)
 
 
@@ -171,17 +173,25 @@ class LoRAHyperNetwork(nn.Module):
         return adapters
 
 def should_adapt_layer(full_name: str, linear: nn.Linear) -> bool:
-    # 1) Only encoder blocks
+    # Only encoder blocks
     if not full_name.startswith("encoder.encoders."):
         return False
 
-    # 2) Skip positional projection
+    # Skip positional projection
     if "linear_pos" in full_name:
         return False
+    
+    # Only self attn
+    # if 'self_attn' not in full_name:
+    #     return False
 
     # Only last few encoder layers
-    # if not any(f"encoder.encoders.{i}." in full_name for i in range(8, 12)):
-    #     return False
+    if not any(f"encoder.encoders.{i}." in full_name for i in range(10, 12)):
+        return False
+    
+    # Only k and v vectors
+    if not any(key in full_name for key in ["linear_k", "linear_v"]):
+        return False
 
     return True
 
@@ -230,6 +240,8 @@ class HyperLoRALightningModule(LightningModule):
         )
         self.hypernetwork = LoRAHyperNetwork(self.adapter_specs, config.lora_rank, config.conditioning_dim)
 
+        self.enable_lora = True
+
     def encode_batch(self, batch):
         inputs, lengths = batch["inputs"], batch["input_lengths"]
         if self.model.modality == "audio":
@@ -242,6 +254,10 @@ class HyperLoRALightningModule(LightningModule):
         return encoded, lengths
 
     def apply_hyper_adapters(self, batch) -> None:
+        # Clear any adapters to prevent from unwanted persistence across samples
+        for adapter in self.adapters.values():
+            adapter.set_adapter(None, None)
+    
         inputs, lengths = batch["inputs"], batch["input_lengths"]
         prefix_frames = min(self.config.prefix_frames, inputs.shape[1])
 
@@ -263,11 +279,17 @@ class HyperLoRALightningModule(LightningModule):
             adapter.set_adapter(lora_A, lora_B)
 
     def forward(self, batch):
-        self.apply_hyper_adapters(batch)
+        if self.enable_lora:
+            self.apply_hyper_adapters(batch)
+        else:
+            for adapter in self.adapters.values():
+                adapter.set_adapter(None, None)
+
         loss, loss_ctc, loss_att, acc = self.model(
             batch["inputs"], batch["input_lengths"], batch["targets"]
         )
         return loss, loss_ctc, loss_att, acc
+
 
     def training_step(self, batch, batch_idx):
         loss, loss_ctc, loss_att, acc = self.forward(batch)
@@ -300,15 +322,42 @@ class HyperLoRALightningModule(LightningModule):
         self.log("val_cer", cer_tensor, prog_bar=True, on_step=False, on_epoch=True)
         self.log("val_wer", wer_tensor, prog_bar=True, on_step=False, on_epoch=True)
 
-        random_batch = random.randint(0, len(batch)-1)
-        if batch_idx == random_batch:
-            self.print(f"Ref: {ref_texts[random_batch]}")
-            self.print(f"Hyp: {hyp_texts[random_batch]}")
+        random_batch = random.randint(0, batch['inputs'].shape[0] - 1)
+        self.print(f"Ref: {ref_texts[random_batch]}")
+        self.print(f"Hyp: {hyp_texts[random_batch]}")
 
+    # def configure_optimizers(self):
+    #     params = list(self.conditioning_encoder.parameters()) + list(self.hypernetwork.parameters())
+    #     optimizer = torch.optim.AdamW(params, lr=self.config.lr, weight_decay=self.config.weight_decay)
+    #     return optimizer
+    
     def configure_optimizers(self):
         params = list(self.conditioning_encoder.parameters()) + list(self.hypernetwork.parameters())
         optimizer = torch.optim.AdamW(params, lr=self.config.lr, weight_decay=self.config.weight_decay)
-        return optimizer
+
+        warmup_epochs = 3
+        total_epochs = self.config.max_epochs
+
+        def lr_lambda(epoch):
+            # epoch is 0-indexed
+            if epoch < warmup_epochs:
+                # linear warmup from 0 -> 1
+                return float(epoch + 1) / float(warmup_epochs)
+            # cosine decay from 1 -> 0
+            progress = float(epoch - warmup_epochs) / float(max(1, total_epochs - warmup_epochs))
+            return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "epoch",
+                "frequency": 1,
+            },
+        }
+
 
 
 class HyperLoRADataModule(DataModule):
@@ -331,19 +380,25 @@ def parse_args():
     parser.add_argument("--val-file", required=True, help="Validation label list file")
     parser.add_argument("--pretrained-model-path", required=True, help="Checkpoint to start from")
     parser.add_argument("--modality", default="video", choices=["video", "audio"], help="Input modality")
-    parser.add_argument("--lora-rank", type=int, default=8, help="Low-rank dimension for LoRA adapters")
-    parser.add_argument("--lora-alpha", type=float, default=16.0, help="Scaling factor for LoRA adapters")
+    parser.add_argument("--lora-rank", type=int, default=16, help="Low-rank dimension for LoRA adapters")
+    parser.add_argument("--lora-alpha", type=float, default=32.0, help="Scaling factor for LoRA adapters")
     parser.add_argument("--lora-dropout", type=float, default=0.05, help="Dropout applied inside LoRA adapters")
-    parser.add_argument("--prefix-frames", type=int, default=4, help="Number of initial frames used for conditioning")
-    parser.add_argument("--conditioning-dim", type=int, default=512, help="Hidden dimension inside the hypernetwork")
-    parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate for the hypernetwork")
+    parser.add_argument("--prefix-frames", type=int, default=16, help="Number of initial frames used for conditioning")
+    parser.add_argument("--conditioning-dim", type=int, default=256, help="Hidden dimension inside the hypernetwork")
+    parser.add_argument("--lr", type=float, default=3e-3, help="Learning rate for the hypernetwork")
     parser.add_argument("--weight-decay", type=float, default=1e-4, help="Weight decay applied to the optimizer")
-    parser.add_argument("--max-epochs", type=int, default=20, help="Training epochs")
+    parser.add_argument("--max-epochs", type=int, default=30, help="Training epochs")
     parser.add_argument("--batch-size", type=int, default=None, help="Batch size (defaults to bucketing only)")
     parser.add_argument("--train-num-buckets", type=int, default=200, help="Number of buckets used for length-aware batching")
     parser.add_argument("--max-frames", type=int, default=1600, help="Maximum frames per batch")
     parser.add_argument("--devices", type=int, default=1, help="Number of GPUs to use if available")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument(
+        "--resume-from",
+        type=str,
+        default=None,
+        help="Path to a Lightning checkpoint to resume a previous hypernetwork run",
+    )
     return parser.parse_args()
 
 
@@ -370,25 +425,34 @@ def main():
         devices=args.devices,
         seed=args.seed,
         max_frames=args.max_frames,
+        resume_from=args.resume_from,
     )
 
     datamodule = HyperLoRADataModule(config)
     module = HyperLoRALightningModule(config)
 
-    checkpoint_cb = ModelCheckpoint(save_last=True, monitor="val_cer", mode="min")
+    checkpoint_cb = ModelCheckpoint(save_last=True, monitor="val_wer", mode="min")
     trainer = Trainer(
         max_epochs=config.max_epochs,
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
         devices=config.devices if torch.cuda.is_available() else None,
         callbacks=[checkpoint_cb, LearningRateMonitor(logging_interval="epoch")],
         log_every_n_steps=10,
+        check_val_every_n_epoch=1,
+        gradient_clip_val=0.5,
     )
 
-    trainer.fit(module, datamodule=datamodule)
+    module.enable_lora = False
+    print("\n==== Initial validation before training ====")
+    trainer.validate(module, datamodule=datamodule)
+    print("============================================\n")
+
+    module.enable_lora = True
+    trainer.fit(module, datamodule=datamodule, ckpt_path=config.resume_from)
     trainer.validate(module, datamodule=datamodule)
 
 
 if __name__ == "__main__":
     main()
 
-# python -m tutorials.hypernetwork_lora_train --root-dir lrs2 --train-file preprocessed_train/labels/lrs2_train_transcript_lengths_seg16s.csv --val-file preprocessed_val/labels/lrs2_val_transcript_lengths_seg16s.csv --pretrained-model-path vsr_trlrs3vox2_base.pth --modality video
+# python -m tutorials.hypernetwork_lora_train --root-dir lrs2 --train-file lrs2/labels/train_main.csv --val-file lrs2/labels/lrs2_val_transcript_lengths_seg16s.csv --pretrained-model-path vsr_trlrs3vox2_base.pth --modality video
